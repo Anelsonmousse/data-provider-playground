@@ -51,11 +51,27 @@ interface AcrossFeeResponse {
   estimatedFillTimeSec: number;
 }
 
+interface AcrossLimitsResponse {
+  minDeposit: string;
+  maxDeposit: string;
+  maxDepositInstant: string;
+  maxDepositShortDelay: string;
+}
+
+interface AcrossToken {
+  address: string;
+  symbol: string;
+  decimals: number;
+  logoURI?: string;
+}
+
 export class DataProviderService {
   private client: AxiosInstance;
   private rateLimiter: Bottleneck;
   private routesCache: AcrossRoute[] | null = null;
   private routesCacheTime: number = 0;
+  private tokensCache: Map<number, AcrossToken[]> = new Map();
+  private tokensCacheTime: number = 0;
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   constructor(
@@ -287,30 +303,59 @@ export class DataProviderService {
     console.log(`[AcrossDataProvider] Fetching available assets`);
 
     const routes = await this.getAvailableRoutes();
+    const uniqueChainIds = new Set<number>();
 
-    // Extract unique assets from routes
+    // Collect all unique chain IDs from routes
+    for (const route of routes) {
+      uniqueChainIds.add(route.originChainId);
+      uniqueChainIds.add(route.destinationChainId);
+    }
+
+    // Fetch token information for all chains
+    const tokensByChain = new Map<string, AcrossToken>();
+    await Promise.all(
+      Array.from(uniqueChainIds).map(async (chainId) => {
+        try {
+          const tokens = await this.getSwapTokens(chainId);
+          tokens.forEach(token => {
+            const key = `${chainId}-${token.address.toLowerCase()}`;
+            tokensByChain.set(key, token);
+          });
+        } catch (error) {
+          console.error(`[AcrossDataProvider] Failed to fetch tokens for chain ${chainId}:`, error);
+        }
+      })
+    );
+
+    // Extract unique assets from routes with proper decimals from API
     const assetsMap = new Map<string, AssetType>();
 
     for (const route of routes) {
       // Add source asset
       const sourceKey = `${route.originChainId}-${route.originToken}`;
+      const sourceTokenKey = `${route.originChainId}-${route.originToken.toLowerCase()}`;
+      const sourceToken = tokensByChain.get(sourceTokenKey);
+      
       if (!assetsMap.has(sourceKey)) {
         assetsMap.set(sourceKey, {
           chainId: route.originChainId.toString(),
           assetId: route.originToken,
           symbol: route.originTokenSymbol,
-          decimals: this.getTokenDecimals(route.originTokenSymbol),
+          decimals: sourceToken?.decimals ?? this.getTokenDecimalsFallback(route.originTokenSymbol),
         });
       }
 
       // Add destination asset
       const destKey = `${route.destinationChainId}-${route.destinationToken}`;
+      const destTokenKey = `${route.destinationChainId}-${route.destinationToken.toLowerCase()}`;
+      const destToken = tokensByChain.get(destTokenKey);
+      
       if (!assetsMap.has(destKey)) {
         assetsMap.set(destKey, {
           chainId: route.destinationChainId.toString(),
           assetId: route.destinationToken,
           symbol: route.destinationTokenSymbol,
-          decimals: this.getTokenDecimals(route.destinationTokenSymbol),
+          decimals: destToken?.decimals ?? this.getTokenDecimalsFallback(route.destinationTokenSymbol),
         });
       }
     }
@@ -344,6 +389,9 @@ export class DataProviderService {
     return response.data;
   }
 
+  /**
+   * Get suggested fees for a bridge transaction
+   */
   private async getSuggestedFees(params: {
     originChainId: number;
     destinationChainId: number;
@@ -353,6 +401,54 @@ export class DataProviderService {
     const response = await this.client.get<AcrossFeeResponse>("/suggested-fees", {
       params,
     });
+    return response.data;
+  }
+
+  /**
+   * Get deposit limits for a specific route
+   */
+  async getLimits(params: {
+    originChainId: number;
+    destinationChainId: number;
+    token: string;
+  }): Promise<AcrossLimitsResponse> {
+    console.log(
+      `[AcrossDataProvider] Fetching limits for chain ${params.originChainId} -> ${params.destinationChainId}, token ${params.token}`
+    );
+    
+    const response = await this.rateLimiter.schedule(() =>
+      this.client.get<AcrossLimitsResponse>("/limits", {
+        params,
+      })
+    );
+    
+    return response.data;
+  }
+
+  /**
+   * Get available tokens for a specific chain
+   */
+  private async getSwapTokens(chainId: number): Promise<AcrossToken[]> {
+    const now = Date.now();
+    
+    // Check cache
+    if (this.tokensCache.has(chainId) && now - this.tokensCacheTime < this.CACHE_TTL) {
+      console.log(`[AcrossDataProvider] Using cached tokens for chain ${chainId}`);
+      return this.tokensCache.get(chainId)!;
+    }
+
+    console.log(`[AcrossDataProvider] Fetching tokens for chain ${chainId}`);
+    const response = await this.rateLimiter.schedule(() =>
+      this.client.get<AcrossToken[]>("/swap/tokens", {
+        params: { chainId },
+      })
+    );
+
+    // Update cache
+    this.tokensCache.set(chainId, response.data);
+    this.tokensCacheTime = now;
+
+    console.log(`[AcrossDataProvider] Cached ${response.data.length} tokens for chain ${chainId}`);
     return response.data;
   }
 
@@ -369,7 +465,11 @@ export class DataProviderService {
     return amountOutNormalized / amountInNormalized;
   }
 
-  private getTokenDecimals(symbol: string): number {
+  /**
+   * Fallback for token decimals when API data is unavailable
+   * Should only be used as a last resort
+   */
+  private getTokenDecimalsFallback(symbol: string): number {
     const decimals: Record<string, number> = {
       USDC: 6,
       "USDC.e": 6,
@@ -383,6 +483,12 @@ export class DataProviderService {
       ACX: 18,
       POOL: 18,
     };
+    
+    console.warn(
+      `[AcrossDataProvider] Using fallback decimals for ${symbol}. ` +
+      `Consider fetching from /swap/tokens endpoint instead.`
+    );
+    
     return decimals[symbol] || 18;
   }
 
